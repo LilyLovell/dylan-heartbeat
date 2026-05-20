@@ -1,4 +1,4 @@
-# Dylan Heartbeat — AI Residency Runtime for Kelivo
+# Heartbeat Routine — AI Residency Runtime for Kelivo
 
 **一个基于 Kelivo 的 AI Agent 运行时。**  
 它不是“聊天接口转发器”，而是一个让 AI 真正**长期居住**的数字环境。
