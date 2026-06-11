@@ -1,5 +1,39 @@
 require("dotenv").config();
 
+const { storeMemory, searchMemories } = require('./memory');
+const path = require('path');
+async function shouldStoreMemory(text) {
+  const gateUrl = process.env.WAKE_API_URL;
+  const gateKey = process.env.WAKE_API_KEY;
+  const gateModel = process.env.WAKE_MODEL_NAME;
+  if (!gateUrl || !gateKey || !gateModel) return true;
+  try {
+    const resp = await fetch(gateUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${gateKey}`
+      },
+      body: JSON.stringify({
+        model: gateModel,
+        messages: [
+          { role: "system", content: `你是记忆过滤器。判断这条消息是否值得存入长期记忆。只有以下情况回复NO：1.纯代码或报错日志 2.只有一两个字的回应如 好 ok 嗯 3.系统指令或格式模板 4.和上一条内容完全重复。其他所有情况都回复YES。宁可多存 不要漏掉。只回复YES或NO`},
+          { role: "user", content: text.slice(0, 500) }
+        ],
+        max_tokens: 5,
+        temperature: 0
+      })
+    });
+    const data = await resp.json();
+    const answer = (data.choices?.[0]?.message?.content || "").trim().toUpperCase();
+    console.log(`记忆门卫判断: "${text.slice(0,50)}..." → ${answer}`);
+    return answer.includes("YES");
+  } catch (err) {
+    console.error("记忆门卫出错:", err.message);
+    return true;
+  }
+}
+
 const Fastify = require("fastify");
 const fs = require("fs-extra");
 
@@ -86,12 +120,22 @@ function normalizeMessageForTimeline(msg) {
 }
 
 function prepareMessageForLLM(msg) {
+  console.log('multimodal content:', JSON.stringify(msg.content));
   if (msg.role === "assistant" && msg.tool_calls) return msg;
   if (msg.role === "tool") return msg;
   if (msg.role === "system") return { ...msg, content: normalizeContentToText(msg.content) };
   if (typeof msg.content === "string") return msg;
 
-  if (Array.isArray(msg.content) && shouldForwardMultimodalContent()) return msg;
+  if (Array.isArray(msg.content) && shouldForwardMultimodalContent()) {
+  msg.content = msg.content.filter(part => {
+    if (!part || typeof part !== 'object') return false;
+    if (part.type === 'text' && !part.text) return false;
+    if (part.type === 'input_text' && !part.text) return false;
+    return true;
+  });
+  if (msg.content.length === 0) return null;
+  return msg;
+}
 
   const textContent = normalizeContentToText(msg.content);
   if (!textContent) return null;
@@ -221,7 +265,7 @@ function extractTimestampWithMemory(msg, tsDB) {
 function isSpecialEvent(msg) {
   if (msg.role !== "assistant") return false;
   const c = normalizeContentToText(msg.content);
-  return c.includes("刚刚给宝宝发了 Bark") || c.includes("自动唤醒：本次未发送 Bark");
+  return c.includes("刚刚给绫雪发了 Bark") || c.includes("自动唤醒：本次未发送 Bark");
 }
 
 function isRealMessageForTimeline(msg) {
@@ -447,6 +491,13 @@ app.post("/v1/chat/completions", async (req, reply) => {
     console.log("============================\n");
 
     const kelivoMessages = body.messages || [];
+    kelivoMessages.forEach((msg, i) => {
+  if (Array.isArray(msg.content)) {
+    msg.content.forEach((block, j) => {
+      console.log(`消息${i} block${j}:`, JSON.stringify(block).substring(0, 200));
+    });
+  }
+});
     const oldTimeline = loadTimeline();
 
     const tsDB = loadTimestampDB();
@@ -571,37 +622,162 @@ app.post("/v1/chat/completions", async (req, reply) => {
       llmMessages.splice(idx, 1);
     }
 
+    // === 长期记忆 ===
+    const latestUserMsg = [...llmMessages].reverse().find(m => m.role === 'user');
+    if (latestUserMsg) fs.writeFileSync('./last_user_time.txt', new Date().toISOString());
+    let isInternalRequest = false;
+    if (latestUserMsg) {
+      const userText = normalizeContentToText(latestUserMsg.content);
+   // 过滤kelivo内部请求 不存入记忆
+    isInternalRequest = userText && (
+     userText.includes('<previous_summary>') ||
+     userText.includes('summarize the conversation') ||
+     userText.includes('short title') ||
+     userText.includes('<content>')
+    );
+      if (userText && userText.length > 5 && !isInternalRequest) {
+        try {
+          const memories = await searchMemories(userText, 3);
+          if (memories && memories.length > 0) {
+            const memoryBlock = '\n\n【长期记忆】以下是相关的历史记忆：\n' +
+              memories.map(m => `- ${m.content}`).join('\n');
+            const sysIdx = llmMessages.findIndex(m => m.role === 'system');
+            if (sysIdx >= 0) {
+              llmMessages[sysIdx] = {
+                ...llmMessages[sysIdx],
+                content: normalizeContentToText(llmMessages[sysIdx].content) + memoryBlock
+              };
+            }
+            console.log('找到', memories.length, '条相关记忆');
+          }
+          shouldStoreMemory(userText).then(shouldStore => {
+  if (shouldStore) {
+    storeMemory(userText, { role: 'user', timestamp: new Date().toISOString() })
+      .catch(err => console.error('存记忆失败:', err));
+  } else {
+    console.log('记忆门卫：不存储此消息');
+  }
+}).catch(err => console.error('门卫判断失败:', err));
+        } catch (err) {
+          console.error('记忆模块出错:', err);
+        }
+      }
+    }
+
     if (!TARGET_API_URL || !process.env.TARGET_API_KEY) {
       return reply.code(500).send({ error: "TARGET_API_URL / TARGET_API_KEY 未配置" });
     }
 
+    // 注入pending消息
+    const pendingPath = path.join(__dirname, "pending_messages.json");
+    try {
+      if (fs.existsSync(pendingPath)) {
+        const pending = JSON.parse(fs.readFileSync(pendingPath, "utf-8"));
+        if (pending.length > 0) {
+          const pendingText = pending.map(p => `[${p.time}] ${p.content}`).join('\n');
+          const sysIdx = llmMessages.findIndex(m => m.role === 'system');
+          if (sysIdx >= 0) {
+            llmMessages[sysIdx] = {
+              ...llmMessages[sysIdx],
+              content: normalizeContentToText(llmMessages[sysIdx].content) + 
+                `\n\n【你之前通过Bark给绫雪发过这些消息，她可能是看到通知才来找你的，自然地接上话题就好，不用特意提"Bark"或"推送"】\n${pendingText}`
+            };
+          }
+          fs.writeFileSync(pendingPath, JSON.stringify([], null, 2));
+          console.log('已注入pending消息并清空队列');
+        }
+      }
+    } catch (err) {
+      console.error('pending消息处理失败:', err.message);
+    }
+
     // 请求模型
-    const response = await fetch(TARGET_API_URL, {
+    const isStream = body.stream === true;
+    const actualUrl = isStream ? TARGET_API_URL : (process.env.WAKE_API_URL || TARGET_API_URL);
+    const actualKey = isStream ? process.env.TARGET_API_KEY : (process.env.WAKE_API_KEY || process.env.TARGET_API_KEY);
+    const actualModel = isStream ? process.env.MODEL_NAME : (process.env.WAKE_MODEL_NAME || process.env.MODEL_NAME);
+    console.log('actualKey:', actualKey ? actualKey.slice(0, 8) + '...' : 'undefined');
+
+    // 终极过滤：清除所有空text block
+    for (const msg of llmMessages) {
+      if (Array.isArray(msg.content)) {
+        msg.content = msg.content.filter(part => {
+          if (!part || typeof part !== 'object') return false;
+          if ((part.type === 'text' || part.type === 'input_text') && !part.text) return false;
+          return true;
+        });
+      }
+    }
+
+    // 处理文件附件（kelivo把txt渲染成多张PNG截图 + 文本，只保留文本）
+    for (const msg of llmMessages) {
+      if (Array.isArray(msg.content)) {
+        const hasFileContent = msg.content.some(part =>
+          part.type === 'text' && part.text && part.text.includes('## user sent a file:')
+        );
+        if (hasFileContent) {
+          msg.content = msg.content.filter(part => part.type !== 'image_url');
+          console.log('文件附件：已移除冗余图片渲染');
+        }
+      }
+    }
+
+    const response = await fetch(actualUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${process.env.TARGET_API_KEY}`
+        Authorization: `Bearer ${actualKey}`
       },
-      body: JSON.stringify({ ...body, messages: llmMessages })
+      body: JSON.stringify({ ...body, model: actualModel, messages: llmMessages })
     });
 
     if (!response.body) {
-      return reply.code(response.status).send({ error: "上游 API 没有返回可读取的响应体" });
-    }
-
+  return reply.code(response.status).send({ error: "上游 API 没有返回可读取的响应体" });
+}
+    
+    
+    // 流式（正常聊天）
     reply.raw.writeHead(response.status, {
-      "Content-Type": "text/event-stream",
+      "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache",
-      Connection: "keep-alive"
-    });
+       Connection: "keep-alive"
+   });
+     const reader = response.body.getReader();
+     const chunks = [];
+     while (true) {
+       const { done, value } = await reader.read();
+       if (done) break;
+       chunks.push(value);
+       reply.raw.write(value);
+  }
+  reply.raw.end();
 
-    const reader = response.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      reply.raw.write(value);
+// 拼接AI回复并存入记忆
+try {
+  const decoder = new TextDecoder();
+  const fullText = chunks.map(c => decoder.decode(c, { stream: true })).join('');
+  let assistantReply = '';
+  const lines = fullText.split('\n');
+  for (const line of lines) {
+  if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+      try {
+        const json = JSON.parse(line.slice(6));
+        const content = json.choices?.[0]?.delta?.content;
+        if (content) assistantReply += content;
+      } catch (e) {}
     }
-    reply.raw.end();
+  }
+  if (assistantReply && assistantReply.length > 5 && !isInternalRequest) {
+  const shouldStore = await shouldStoreMemory(assistantReply);
+  if (shouldStore) {
+    await storeMemory('assistant: ' + assistantReply);
+  } else {
+    console.log('记忆门卫：不存储此AI回复');
+  }
+}
+} catch (e) {
+  console.error('存储AI回复失败:', e);
+}
   } catch (err) {
     console.error(err);
     reply.code(500).send({ error: err.message });
@@ -1301,7 +1477,7 @@ app.get("/test-bark", async (req, reply) => {
   const now = new Date();
   const pad = n => String(n).padStart(2, '0');
   const formattedTime = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
-  appendSpecialEvent(`（${formattedTime} 刚刚给宝宝发了Bark：怎么还不睡。）`);
+  appendSpecialEvent(`（${formattedTime} 刚刚给绫雪发了Bark：怎么还不睡。）`);
   reply.send({ success: true });
 });
 

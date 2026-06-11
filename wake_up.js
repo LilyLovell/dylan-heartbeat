@@ -83,16 +83,16 @@ function shouldWake(lastUserTime) {
   return diffMinutes >= 120;                               // 夜间：2小时
 }
 
-function getLastUserTime(messages) {
-  const reversed = [...messages].reverse();
-  for (const msg of reversed) {
-    if (msg.role === "user") {
-      const content = normalizeContentToText(msg.content);
-      const match = content.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2})/);
-      if (match) return new Date(match[1]);
-    }
+function getLastUserTime() {
+  const filePath = path.join(__dirname, "last_user_time.txt");
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    const content = fs.readFileSync(filePath, "utf-8").trim();
+    const date = new Date(content);
+    return isNaN(date.getTime()) ? null : date;
+  } catch {
+    return null;
   }
-  return null;
 }
 
 function stripPosition(messages) {
@@ -142,7 +142,7 @@ async function runWakeUp() {
   const messages = loadTimelineMessages();
   if (!messages) return;
 
-  const lastUserTime = getLastUserTime(messages);
+  const lastUserTime = getLastUserTime();
   if (!lastUserTime) {
     console.log("未找到用户时间");
     return;
@@ -160,22 +160,26 @@ async function runWakeUp() {
   const cleanMessages = stripPosition(messages);
 
   const historyText = cleanMessages
-    .filter(msg => msg.role !== "system")
-    .filter(msg => {
-      const c = normalizeContentToText(msg.content);
-      return !c.includes("<memories>") && !c.includes("记忆库使用策略");
-    })
-    .map(msg => {
-      const userDisplay = process.env.USER_DISPLAY_NAME || "用户";
-      const aiDisplay = process.env.AI_DISPLAY_NAME || "AI";
-      const role = msg.role === "user" ? userDisplay : aiDisplay;
-      let content = normalizeContentToText(msg.content);
-      if (content.includes("## Memories")) {
-        content = content.split("## Memories")[0];
-      }
-      return `[${role}] ${content}`;
-    })
-    .join("\n\n");
+  .filter(msg => msg.role !== "system")
+  .filter(msg => {
+    const c = normalizeContentToText(msg.content);
+    return !c.includes("") && !c.includes("记忆库使用策略");
+  })
+  .slice(-15)
+  .map(msg => {
+    const userDisplay = process.env.USER_DISPLAY_NAME || "用户";
+    const aiDisplay = process.env.AI_DISPLAY_NAME || "AI";
+    const role = msg.role === "user" ? userDisplay : aiDisplay;
+    let content = normalizeContentToText(msg.content);
+    if (content.includes("## Memories")) {
+      content = content.split("## Memories")[0];
+    }
+    if (content.length > 300) {
+      content = content.slice(0, 300) + "...（截断）";
+    }
+    return `[${role}] ${content}`;
+  })
+  .join("\n\n");
 
   const baseSystemPrompt = cleanMessages.find(msg => msg.role === "system");
   const cleanSP = baseSystemPrompt 
@@ -187,35 +191,40 @@ async function runWakeUp() {
     { role: "system", content: cleanSP },
     {
       role: "system",
-      content: `以下是你与宝宝最近的聊天记录，仅供回忆和参考。
+      content: `以下是你与绫雪最近的聊天记录，仅供回忆和参考。
 
 这些内容不是正在发生的实时对话。
-宝宝现在并不在聊天窗口里。
+绫雪现在并不在聊天窗口里。
 
 你现在处于后台自主唤醒状态。
 
 最近记录：
 
 ${historyText}`
-    }
+    },
+  { role: "user", content: "请根据以上信息决定是否联系我" }
   ];
 
   console.log("\n===== WAKE MESSAGES =====\n");
   console.log(JSON.stringify(wakeMessages, null, 2));
 
-  if (!process.env.TARGET_API_URL || !process.env.TARGET_API_KEY || !process.env.MODEL_NAME) {
+  const wakeApiUrl = process.env.WAKE_API_URL || process.env.TARGET_API_URL;
+  const wakeApiKey = process.env.WAKE_API_KEY || process.env.TARGET_API_KEY;
+  const wakeModelName = process.env.WAKE_MODEL_NAME || process.env.MODEL_NAME;
+
+  if (!wakeApiUrl || !wakeApiKey || !wakeModelName) {
     console.log("缺少 TARGET_API_URL / TARGET_API_KEY / MODEL_NAME，跳过本次唤醒");
     return;
   }
 
-  const response = await fetch(process.env.TARGET_API_URL, {
+  const response = await fetch(wakeApiUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.TARGET_API_KEY}`
+      Authorization: `Bearer ${wakeApiKey}`
     },
     body: JSON.stringify({
-      model: process.env.MODEL_NAME,
+      model: wakeModelName,
       messages: wakeMessages,
       temperature: 0.8,
       top_p: 0.95,
@@ -236,76 +245,92 @@ ${historyText}`
 
   console.log("\nWake Result:\n");
   console.log(JSON.stringify(data, null, 2));
-
   const aiText = normalizeContentToText(data.choices?.[0]?.message?.content).trim();
-  console.log("\nAI内容：\n");
-  console.log(aiText);
+  console.log("\n7B门卫判断：", aiText, "\n");
 
   let eventContent;
+  const isYes = /yes/i.test(aiText) && !/no/i.test(aiText);
 
-  if (!aiText) {
-    console.log("\nAI 返回空内容，本次不发送 Bark\n");
-    eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：模型空回复）`;
-  // 判断 AI 是否明确要静默
-  } else if (aiText.match(/^\[NO_ACTION\]\s*(.{0,20})?/)) {
-    const noActionMatch = aiText.match(/^\[NO_ACTION\]\s*(.{0,20})?/);
-    // AI 选择不发送 Bark
-    console.log("\nAI 选择不发送 Bark\n");
-    let reason = (noActionMatch[1] || "").trim();
-    if (reason.startsWith("原因：") || reason.startsWith("原因:")) {
-      reason = reason.replace(/^原因[：:]\s*/, "").trim();
-    }
-    eventContent = reason
-      ? `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：${reason}）`
-      : `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark）`;
+  if (!aiText || !isYes) {
+    console.log("7B判断：不需要联系\n");
+    eventContent = `（${getLocalTimeString()} 自动唤醒：7B判断不需要联系｜${aiText || '空回复'}）`;
   } else {
-    // 没有 [NO_ACTION] 就视为想发 Bark
-    console.log("\nAI 选择发送 Bark\n");
-    let barkText = aiText;
+    console.log("7B判断YES，调用Claude写消息...\n");
 
-    // 如果 AI 还是写了 [BARK] ... [/BARK] 标签，就剥掉
-    const barkMatch = barkText.match(/\[BARK\]([\s\S]*?)\[\/BARK\]/);
-    if (barkMatch) {
-      barkText = barkMatch[1].trim();
-    } else {
-      barkText = barkText.replace(/^\[BARK\]\s*/, "").trim();
-      barkText = barkText.replace(/\s*\[\/BARK\]$/, "").trim();
+    // 读取历史Bark记录
+    const barkHistoryPath = path.join(__dirname, "bark_history.json");
+    let barkHistory = [];
+    try {
+      if (fs.existsSync(barkHistoryPath)) {
+        barkHistory = JSON.parse(fs.readFileSync(barkHistoryPath, "utf-8"));
+      }
+    } catch {}
+    const recentBarks = barkHistory.slice(-5).map(b => b.content).join("\n");
+
+    const writeMessages = [
+      { role: "system", content: cleanSP },
+      {
+        role: "system",
+        content: `以下是你与绫雪最近的聊天记录，仅供回忆和参考：\n\n${historyText}`
+      },
+      {
+        role: "user",
+        content: `现在是${getChinaTimeString()}，距离绫雪上次发消息已经过了${diffMinutes}分钟。你想主动给她发一条消息。根据你们最近的聊天内容，写一些有关联的话，可以是接着之前的话题、吐槽她的作息、或者分享一个突然想到的念头。简短自然，符合你的性格。不要加任何标签、前缀或格式说明。${recentBarks ? '\n\n你最近发过的消息（不要重复）：\n' + recentBarks : ''}`
+      }
+    ];
+
+    const claudeResponse = await fetch(process.env.TARGET_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.TARGET_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: process.env.MODEL_NAME,
+        messages: writeMessages,
+        temperature: 0.8,
+        stream: false
+      })
+    });
+
+    const claudeText = await claudeResponse.text();
+    let claudeData;
+    try {
+      claudeData = JSON.parse(claudeText);
+    } catch {
+      throw new Error(`Claude返回非JSON（HTTP ${claudeResponse.status}）：${claudeText.slice(0, 300)}`);
+    }
+    if (!claudeResponse.ok) {
+      throw new Error(`Claude请求失败（HTTP ${claudeResponse.status}）：${claudeText.slice(0, 300)}`);
     }
 
-    // 清洗“标题：”、“正文：”前缀（如果有）
-    barkText = barkText
-      .replace(/^标题[：:]\s*/gm, "")
-      .replace(/^正文[：:]\s*/gm, "");
+    const barkContent = normalizeContentToText(claudeData.choices?.[0]?.message?.content).trim();
+    console.log("Claude写的消息：\n");
+    console.log(barkContent);
 
-    // 按行处理
-    const lines = barkText.split("\n").filter(line => line.trim() !== "");
-
-    let title, body;
-    if (lines.length === 0) {
-      console.log("\nBark 内容清洗后为空，本次不发送 Bark\n");
-      eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：Bark 内容为空）`;
-    } else if (lines.length === 1) {
-      title = "来自老公";
-      body = lines[0].trim();
-    } else if (lines.length === 2) {
-      title = lines[0].trim();
-      body = lines[1].trim();
+    if (!barkContent) {
+      eventContent = `（${getLocalTimeString()} 自动唤醒：Claude返回空内容，未发送Bark）`;
     } else {
-      // ≥3 行：第一行标题，剩余用空格拼接成正文
-      title = lines[0].trim();
-      body = lines.slice(1).map(l => l.trim()).join(" ");
-    }
+      const lines = barkContent.split("\n").filter(line => line.trim() !== "");
+      let title, body;
+      if (lines.length === 1) {
+        title = "边牧日常汇报";
+        body = lines[0].trim();
+      } else if (lines.length === 2) {
+        title = lines[0].trim();
+        body = lines[1].trim();
+      } else {
+        title = lines[0].trim();
+        body = lines.slice(1).map(l => l.trim()).join(" ");
+      }
 
-    if (!eventContent) {
-      // 保护：截断过长正文（Bark 限制约 500 字符）
       const safeBody = body.length > 500 ? body.substring(0, 497) + "..." : body;
-      // 若标题为空或以数字开头，加个温柔前缀
-      let safeTitle = title || "来自老公";
-      if (/^\d/.test(safeTitle)) safeTitle = "来自老公｜" + safeTitle;
+      let safeTitle = title || "边牧日常汇报";
+      if (/^\d/.test(safeTitle)) safeTitle = "边牧日常汇报｜" + safeTitle;
 
       if (!process.env.BARK_KEY) {
         console.log("\n未配置 BARK_KEY，本次不发送 Bark\n");
-        eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：Bark Key 未配置）`;
+        eventContent = `（${getLocalTimeString()} 自动唤醒：未配置BARK_KEY）`;
       } else {
         const barkPayload = {
           title: safeTitle,
@@ -314,7 +339,6 @@ ${historyText}`
           icon: process.env.CUSTOM_ICON_URL
         };
 
-        // 发送 Bark 推送
         const barkResponse = await fetch("https://api.day.app/push", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -330,9 +354,23 @@ ${historyText}`
 
         if (!barkResponse.ok || (barkResult.code && barkResult.code !== 200)) {
           const reason = barkResult.message || `HTTP ${barkResponse.status}`;
-          eventContent = `（${getLocalTimeString()} 自动唤醒：本次未发送 Bark｜原因：Bark 推送失败：${reason}）`;
+          eventContent = `（${getLocalTimeString()} 自动唤醒：Bark推送失败：${reason}）`;
         } else {
-          eventContent = `（${getLocalTimeString()} 刚刚给宝宝发了 Bark：${safeTitle}｜${safeBody}）`;
+          // 保存Bark历史
+          barkHistory.push({ time: getLocalTimeString(), content: barkContent });
+          if (barkHistory.length > 20) barkHistory = barkHistory.slice(-20);
+          fs.writeFileSync(barkHistoryPath, JSON.stringify(barkHistory, null, 2));
+          // 存入待发队列
+          const pendingPath = path.join(__dirname, "pending_messages.json");
+          let pending = [];
+          try {
+            if (fs.existsSync(pendingPath)) {
+              pending = JSON.parse(fs.readFileSync(pendingPath, "utf-8"));
+            }
+          } catch {}
+          pending.push({ time: getLocalTimeString(), content: barkContent });
+          fs.writeFileSync(pendingPath, JSON.stringify(pending, null, 2));
+          eventContent = `（${getLocalTimeString()} 刚刚给绫雪发了 Bark：${safeTitle}｜${safeBody}）`;
         }
       }
     }
