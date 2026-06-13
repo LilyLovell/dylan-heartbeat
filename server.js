@@ -722,62 +722,118 @@ app.post("/v1/chat/completions", async (req, reply) => {
       }
     }
 
+     // 判断是否直连Anthropic
+    const isAnthropic = actualUrl.includes('anthropic.com');
+
+    // 构建请求体（Anthropic格式和OpenAI格式不同）
+    let fetchBody;
+    if (isAnthropic) {
+      const systemMsgs = llmMessages.filter(m => m.role === 'system');
+      const nonSystemMsgs = llmMessages.filter(m => m.role !== 'system');
+      const systemText = systemMsgs.map(m => normalizeContentToText(m.content)).join('\n\n');
+      fetchBody = {
+        model: actualModel,
+        max_tokens: body.max_tokens || 4096,
+        stream: true,
+        messages: nonSystemMsgs
+      };
+      if (systemText) fetchBody.system = systemText;
+    } else {
+      fetchBody = { ...body, model: actualModel, messages: llmMessages };
+    }
+
     const response = await fetch(actualUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${actualKey}`
+        ...(isAnthropic
+          ? { "x-api-key": actualKey, "anthropic-version": "2023-06-01" }
+          : { Authorization: `Bearer ${actualKey}` })
       },
-      body: JSON.stringify({ ...body, model: actualModel, messages: llmMessages })
+      body: JSON.stringify(fetchBody)
     });
 
     if (!response.body) {
-  return reply.code(response.status).send({ error: "上游 API 没有返回可读取的响应体" });
-}
-    
-    
-    // 流式（正常聊天）
+      return reply.code(response.status).send({ error: "上游 API 没有返回可读取的响应体" });
+    }
+
     reply.raw.writeHead(response.status, {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache",
-       Connection: "keep-alive"
-   });
-     const reader = response.body.getReader();
-     const chunks = [];
-     while (true) {
-       const { done, value } = await reader.read();
-       if (done) break;
-       chunks.push(value);
-       reply.raw.write(value);
-  }
-  reply.raw.end();
+      Connection: "keep-alive"
+    });
 
-// 拼接AI回复并存入记忆
-try {
-  const decoder = new TextDecoder();
-  const fullText = chunks.map(c => decoder.decode(c, { stream: true })).join('');
-  let assistantReply = '';
-  const lines = fullText.split('\n');
-  for (const line of lines) {
-  if (line.startsWith('data: ') && !line.includes('[DONE]')) {
-      try {
-        const json = JSON.parse(line.slice(6));
-        const content = json.choices?.[0]?.delta?.content;
-        if (content) assistantReply += content;
-      } catch (e) {}
+    const reader = response.body.getReader();
+    const chunks = [];
+
+    if (isAnthropic) {
+      // Anthropic SSE → OpenAI SSE 格式转换
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (data.type === 'content_block_delta' && data.delta?.text) {
+              const chunk = `data: ${JSON.stringify({
+                id: 'chatcmpl-' + Date.now(),
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: actualModel,
+                choices: [{ index: 0, delta: { content: data.delta.text }, finish_reason: null }]
+              })}\n\n`;
+              const encoded = new TextEncoder().encode(chunk);
+              chunks.push(encoded);
+              reply.raw.write(encoded);
+            } else if (data.type === 'message_stop') {
+              reply.raw.write(new TextEncoder().encode('data: [DONE]\n\n'));
+            }
+          } catch (e) {}
+        }
+      }
+    } else {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        reply.raw.write(value);
+      }
     }
-  }
-  if (assistantReply && assistantReply.length > 5 && !isInternalRequest) {
-  const shouldStore = await shouldStoreMemory(assistantReply);
-  if (shouldStore) {
-    await storeMemory('assistant: ' + assistantReply);
-  } else {
-    console.log('记忆门卫：不存储此AI回复');
-  }
-}
-} catch (e) {
-  console.error('存储AI回复失败:', e);
-}
+    reply.raw.end();
+
+    // 拼接AI回复并存入记忆
+    try {
+      const decoder = new TextDecoder();
+      const fullText = chunks.map(c => decoder.decode(c, { stream: true })).join('');
+      let assistantReply = '';
+      const rLines = fullText.split('\n');
+      for (const rLine of rLines) {
+        if (rLine.startsWith('data: ') && !rLine.includes('[DONE]')) {
+          try {
+            const json = JSON.parse(rLine.slice(6));
+            const content = json.choices?.[0]?.delta?.content;
+            if (content) assistantReply += content;
+          } catch (e) {}
+        }
+      }
+      if (assistantReply && assistantReply.length > 5 && !isInternalRequest) {
+        const shouldStore = await shouldStoreMemory(assistantReply);
+        if (shouldStore) {
+          await storeMemory('assistant: ' + assistantReply);
+        } else {
+          console.log('记忆门卫：不存储此AI回复');
+        }
+      }
+    } catch (e) {
+      console.error('存储AI回复失败:', e);
+    }
+
   } catch (err) {
     console.error(err);
     reply.code(500).send({ error: err.message });
