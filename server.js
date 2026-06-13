@@ -725,11 +725,31 @@ app.post("/v1/chat/completions", async (req, reply) => {
      // 判断是否直连Anthropic
     const isAnthropic = actualUrl.includes('anthropic.com');
 
+    // OpenAI图片格式 → Anthropic图片格式
+    function convertToAnthropicFormat(msgs) {
+      return msgs.map(msg => {
+        if (!Array.isArray(msg.content)) return msg;
+        const newContent = msg.content.map(part => {
+          if (part.type === 'image_url' && part.image_url?.url) {
+            const match = part.image_url.url.match(/^data:(image\/\w+);base64,(.+)/);
+            if (match) {
+              return {
+                type: 'image',
+                source: { type: 'base64', media_type: match[1], data: match[2] }
+              };
+            }
+          }
+          return part;
+        });
+        return { ...msg, content: newContent };
+      });
+    }
+
     // 构建请求体（Anthropic格式和OpenAI格式不同）
     let fetchBody;
     if (isAnthropic) {
       const systemMsgs = llmMessages.filter(m => m.role === 'system');
-      const nonSystemMsgs = llmMessages.filter(m => m.role !== 'system');
+      const nonSystemMsgs = convertToAnthropicFormat(llmMessages.filter(m => m.role !== 'system'));
       const systemText = systemMsgs.map(m => normalizeContentToText(m.content)).join('\n\n');
       fetchBody = {
         model: actualModel,
