@@ -757,10 +757,16 @@ app.post("/v1/chat/completions", async (req, reply) => {
         stream: true,
         messages: nonSystemMsgs
       };
-      if (systemText) fetchBody.system = systemText;
-    } else {
-      fetchBody = { ...body, model: actualModel, messages: llmMessages };
+      if (systemText) {
+        fetchBody.system = [{
+         type: "text",
+         text: systemText,
+         cache_control: { type: "ephemeral" }
+     }];
     }
+     } else {
+     fetchBody = { ...body, model: actualModel, messages: llmMessages };
+     }
 
     const response = await fetch(actualUrl, {
       method: "POST",
