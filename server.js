@@ -749,7 +749,14 @@ app.post("/v1/chat/completions", async (req, reply) => {
     let fetchBody;
     if (isAnthropic) {
       const systemMsgs = llmMessages.filter(m => m.role === 'system');
-      const nonSystemMsgs = convertToAnthropicFormat(llmMessages.filter(m => m.role !== 'system'));
+      const nonSystemMsgs = convertToAnthropicFormat(
+       llmMessages
+        .filter(m => m.role !== 'system' && m.role !== 'tool' && !m.tool_calls)
+        .map(m => {
+          const { reasoning_content, ...rest } = m;
+         return rest;
+        })
+     );
       const systemText = systemMsgs.map(m => normalizeContentToText(m.content)).join('\n\n');
       fetchBody = {
         model: actualModel,
@@ -758,11 +765,11 @@ app.post("/v1/chat/completions", async (req, reply) => {
         messages: nonSystemMsgs
       };
       if (systemText) fetchBody.system = systemText;
-     } else {
-       fetchBody = { ...body, model: actualModel, messages: llmMessages };
-     }
+    } else {
+      fetchBody = { ...body, model: actualModel, messages: llmMessages };
+    }
 
-    if (isAnthropic) fetchBody.cache_control = { type: "auto" };
+
     const response = await fetch(actualUrl, {
       method: "POST",
       headers: {
@@ -773,6 +780,11 @@ app.post("/v1/chat/completions", async (req, reply) => {
       },
       body: JSON.stringify(fetchBody)
     });
+    if (!response.ok) {
+    const errText = await response.text();
+    console.log("上游API错误:", response.status, errText);
+  return reply.code(response.status).send(errText);
+    }
 
     if (!response.body) {
       return reply.code(response.status).send({ error: "上游 API 没有返回可读取的响应体" });
