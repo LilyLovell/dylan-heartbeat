@@ -758,13 +758,32 @@ app.post("/v1/chat/completions", async (req, reply) => {
         })
      );
       const systemText = systemMsgs.map(m => normalizeContentToText(m.content)).join('\n\n');
+      console.log("system末尾100字:", systemText.substring(systemText.length - 100));
+      console.log("system总长度:", systemText.length);
       fetchBody = {
         model: actualModel,
-        max_tokens: body.max_tokens || 4096,
+        max_tokens: body.max_tokens || 16000,
+        thinking: {
+         type: "enabled",
+         budget_tokens: 8000
+        },
+        temperature: 1,
         stream: true,
         messages: nonSystemMsgs
       };
-      if (systemText) fetchBody.system = systemText;
+    if (systemText) {
+      const splitIndex = systemText.indexOf('<recent_chats>');
+      if (splitIndex > 0) {
+       fetchBody.system = [
+        { type: "text", text: systemText.substring(0, splitIndex).trim(), cache_control: { type: "ephemeral" } },
+        { type: "text", text: systemText.substring(splitIndex).trim() }
+    ];
+   } else {
+     fetchBody.system = [
+       { type: "text", text: systemText, cache_control: { type: "ephemeral" } }
+     ];
+   }
+ }
     } else {
       fetchBody = { ...body, model: actualModel, messages: llmMessages };
     }
@@ -813,7 +832,21 @@ app.post("/v1/chat/completions", async (req, reply) => {
           if (!line.startsWith('data: ')) continue;
           try {
             const data = JSON.parse(line.slice(6));
-            if (data.type === 'content_block_delta' && data.delta?.text) {
+          if (data.type === 'content_block_delta' && data.delta?.type === 'thinking_delta') {
+            const chunk = `data: ${JSON.stringify({
+             id: 'chatcmpl-' + Date.now(),
+             object: 'chat.completion.chunk',
+             created: Math.floor(Date.now() / 1000),
+             model: actualModel,
+             choices: [{ index: 0, delta: { reasoning_content: data.delta.thinking }, finish_reason: null }]
+           })}\n\n`;
+           const encoded = new TextEncoder().encode(chunk);
+           chunks.push(encoded);
+           reply.raw.write(encoded);
+          continue;
+        }
+       if (data.type === 'content_block_delta' && data.delta?.text) {
+      // 原来的正文处理...
               const chunk = `data: ${JSON.stringify({
                 id: 'chatcmpl-' + Date.now(),
                 object: 'chat.completion.chunk',
