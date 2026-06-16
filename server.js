@@ -17,7 +17,7 @@ async function shouldStoreMemory(text) {
       body: JSON.stringify({
         model: gateModel,
         messages: [
-          { role: "system", content: `你是记忆过滤器。判断这条消息是否值得存入长期记忆。只有以下情况回复NO：1.纯代码或报错日志 2.只有一两个字的回应如 好 ok 嗯 3.系统指令或格式模板 4.和上一条内容完全重复。其他所有情况都回复YES。宁可多存 不要漏掉。只回复YES或NO`},
+          { role: "system", content: `你是记忆过滤器。判断这条消息是否值得存入长期记忆。只回复YES或NO。\n\n回复NO的情况：1.纯代码或报错日志 2.纯系统指令或格式模板 3.和上一条内容完全重复 4.无意义的单字如 好 ok 嗯 哦 k\n\n回复YES的情况：所有其他情况都回复YES。特别注意：短但有情感价值的消息（如 爱你、想你了、晚安、抱抱、贴贴、喜欢你）必须回复YES。宁可多存 不要漏掉。`},
           { role: "user", content: text.slice(0, 500) }
         ],
         max_tokens: 5,
@@ -650,14 +650,6 @@ app.post("/v1/chat/completions", async (req, reply) => {
             }
             console.log('找到', memories.length, '条相关记忆');
           }
-          shouldStoreMemory(userText).then(shouldStore => {
-  if (shouldStore) {
-    storeMemory(userText, { role: 'user', timestamp: new Date().toISOString() })
-      .catch(err => console.error('存记忆失败:', err));
-  } else {
-    console.log('记忆门卫：不存储此消息');
-  }
-}).catch(err => console.error('门卫判断失败:', err));
         } catch (err) {
           console.error('记忆模块出错:', err);
         }
@@ -725,69 +717,149 @@ app.post("/v1/chat/completions", async (req, reply) => {
      // 判断是否直连Anthropic
     const isAnthropic = actualUrl.includes('anthropic.com');
 
-    // OpenAI图片格式 → Anthropic图片格式
+    // OpenAI格式 → Anthropic格式（图片+工具调用+工具结果）
     function convertToAnthropicFormat(msgs) {
-      return msgs.map(msg => {
-        if (!Array.isArray(msg.content)) return msg;
-        const newContent = msg.content.map(part => {
-          if (part.type === 'image_url' && part.image_url?.url) {
-            const match = part.image_url.url.match(/^data:(image\/\w+);base64,(.+)/);
-            if (match) {
-              return {
-                type: 'image',
-                source: { type: 'base64', media_type: match[1], data: match[2] }
-              };
-            }
+      const result = [];
+      for (const msg of msgs) {
+        const { reasoning_content, ...cleanMsg } = msg;
+
+        if (cleanMsg.role === 'assistant' && cleanMsg.tool_calls) {
+          // assistant的tool_calls → Anthropic的tool_use content block
+          const content = [];
+          if (cleanMsg.content && typeof cleanMsg.content === 'string' && cleanMsg.content.trim()) {
+            content.push({ type: 'text', text: cleanMsg.content });
           }
-          return part;
-        });
-        return { ...msg, content: newContent };
-      });
+          for (const tc of cleanMsg.tool_calls) {
+            let parsedInput;
+            try {
+              parsedInput = typeof tc.function?.arguments === 'string'
+                ? JSON.parse(tc.function.arguments)
+                : (tc.function?.arguments || {});
+            } catch { parsedInput = {}; }
+            content.push({
+              type: 'tool_use',
+              id: tc.id,
+              name: tc.function?.name || '',
+              input: parsedInput
+            });
+          }
+          result.push({ role: 'assistant', content });
+
+        } else if (cleanMsg.role === 'tool') {
+          // tool结果 → Anthropic的tool_result（塞进user消息）
+          const toolResult = {
+            type: 'tool_result',
+            tool_use_id: cleanMsg.tool_call_id,
+            content: typeof cleanMsg.content === 'string' ? cleanMsg.content : JSON.stringify(cleanMsg.content)
+          };
+        // 连续多个tool结果合并到同一个user消息里
+          const last = result[result.length - 1];
+          if (last && last.role === 'user' && Array.isArray(last.content) &&
+              last.content.length > 0 && last.content[0].type === 'tool_result') {
+            last.content.push(toolResult);
+          } else {
+            result.push({ role: 'user', content: [toolResult] });
+          }
+
+        } else {
+        // 普通消息 转换图片格式
+          if (Array.isArray(cleanMsg.content)) {
+            const newContent = cleanMsg.content.map(part => {
+              if (part.type === 'image_url' && part.image_url?.url) {
+                const match = part.image_url.url.match(/^data:(image\/\w+);base64,(.+)/);
+                if (match) {
+                  return {
+                    type: 'image',
+                    source: { type: 'base64', media_type: match[1], data: match[2] }
+                  };
+                }
+              }
+              return part;
+            });
+            result.push({ ...cleanMsg, content: newContent });
+          } else {
+            result.push(cleanMsg);
+          }
+        }
+      }
+      return result;
     }
 
-    // 构建请求体（Anthropic格式和OpenAI格式不同）
-    let fetchBody;
-    if (isAnthropic) {
-      const systemMsgs = llmMessages.filter(m => m.role === 'system');
-      const nonSystemMsgs = convertToAnthropicFormat(
-       llmMessages
-        .filter(m => m.role !== 'system' && m.role !== 'tool' && !m.tool_calls)
-        .map(m => {
-          const { reasoning_content, ...rest } = m;
-         return rest;
-        })
-     );
-      const systemText = systemMsgs.map(m => normalizeContentToText(m.content)).join('\n\n');
-      console.log("system末尾100字:", systemText.substring(systemText.length - 100));
-      console.log("system总长度:", systemText.length);
-      fetchBody = {
-        model: actualModel,
-        max_tokens: body.max_tokens || 16000,
-        thinking: {
-         type: "enabled",
-         budget_tokens: 8000
-        },
-        temperature: 1,
-        stream: true,
-        messages: nonSystemMsgs
-      };
-    if (systemText) {
-      const splitIndex = systemText.indexOf('<recent_chats>');
-      if (splitIndex > 0) {
-       fetchBody.system = [
-        { type: "text", text: systemText.substring(0, splitIndex).trim(), cache_control: { type: "ephemeral" } },
-        { type: "text", text: systemText.substring(splitIndex).trim() }
-    ];
-   } else {
-     fetchBody.system = [
-       { type: "text", text: systemText, cache_control: { type: "ephemeral" } }
-     ];
-   }
- }
-    } else {
-      fetchBody = { ...body, model: actualModel, messages: llmMessages };
-    }
+      // OpenAI工具定义 → Anthropic工具定义
+       function convertToolsDefinition(tools) {
+        if (!tools || !Array.isArray(tools)) return undefined;
+        return tools.map(t => {
+          if (t.type === 'function' && t.function) {
+            return {
+              name: t.function.name,
+              description: t.function.description || '',
+              input_schema: t.function.parameters || { type: 'object', properties: {} }
+            };
+          }
+          return t;
+         });
+       }
 
+     // 构建请求体（Anthropic格式和OpenAI格式不同）
+       let fetchBody;
+       if (isAnthropic) {
+         const systemMsgs = llmMessages.filter(m => m.role === 'system');
+         // 不再过滤tool和tool_calls 交给convertToAnthropicFormat转换
+         const nonSystemMsgs = convertToAnthropicFormat(
+           llmMessages.filter(m => m.role !== 'system')
+         );
+         const systemText = systemMsgs.map(m => normalizeContentToText(m.content)).join('\n\n');
+         console.log("system末尾100字:", systemText.substring(systemText.length - 100));
+         console.log("system总长度:", systemText.length);
+         fetchBody = {
+           model: actualModel,
+           max_tokens: body.max_tokens || 16000,
+           thinking: {
+             type: "enabled",
+             budget_tokens: 8000
+           },
+           temperature: 1,
+           stream: true,
+           messages: nonSystemMsgs
+         };
+
+       // 转换并添加工具定义
+         const anthropicTools = convertToolsDefinition(body.tools);
+         if (anthropicTools && anthropicTools.length > 0) {
+           fetchBody.tools = anthropicTools;
+         }
+
+         if (systemText) {
+           const splitIndex = systemText.indexOf('<recent_chats>');
+           if (splitIndex > 0) {
+             fetchBody.system = [
+               { type: "text", text: systemText.substring(0, splitIndex).trim(), cache_control: { type: "ephemeral" } },
+               { type: "text", text: systemText.substring(splitIndex).trim() }
+             ];
+           } else {
+             fetchBody.system = [
+               { type: "text", text: systemText, cache_control: { type: "ephemeral" } }
+             ];
+           }
+         }
+       } else {
+       // 中转站：剥离不支持的thinking参数
+         const { thinking, output_config, ...cleanBody } = body;
+         fetchBody = { ...cleanBody, model: actualModel, messages: llmMessages };
+       }
+
+      // 注入记忆标记指令（仅正常对话 不对内部请求注入）
+      if (!isInternalRequest) {
+        const memSysIdx = llmMessages.findIndex(m => m.role === 'system');
+        if (memSysIdx >= 0) {
+          console.log('✅ 记忆标记指令已注入');
+          llmMessages[memSysIdx] = {
+            ...llmMessages[memSysIdx],
+            content: '【记忆标记】每次回复末尾加 [MEM:YES] 或 [MEM:NO]，判断本轮对话是否值得存入长期记忆。YES=有意义的内容（情感、事件、个人信息、重要讨论）；NO=无意义的内容（纯操作指令、单字回应、代码调试细节）。宁可YES不要漏。此标记对用户不可见，会被网关自动截取。\n\n' +
+            normalizeContentToText(llmMessages[memSysIdx].content)
+          };
+        }
+      }
 
     const response = await fetch(actualUrl, {
       method: "POST",
@@ -809,96 +881,173 @@ app.post("/v1/chat/completions", async (req, reply) => {
       return reply.code(response.status).send({ error: "上游 API 没有返回可读取的响应体" });
     }
 
-    reply.raw.writeHead(response.status, {
+      reply.raw.writeHead(response.status, {
       "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache",
       Connection: "keep-alive"
     });
 
     const reader = response.body.getReader();
-    const chunks = [];
+    const decoder = new TextDecoder();
+    let assistantReply = '';
+    let memDecision = null;
 
-    if (isAnthropic) {
-      // Anthropic SSE → OpenAI SSE 格式转换
-      const decoder = new TextDecoder();
-      let buffer = '';
+    if (!isStream) {
+      // 非流式（标题/摘要）：直接转发
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          try {
-            const data = JSON.parse(line.slice(6));
-          if (data.type === 'content_block_delta' && data.delta?.type === 'thinking_delta') {
-            const chunk = `data: ${JSON.stringify({
-             id: 'chatcmpl-' + Date.now(),
-             object: 'chat.completion.chunk',
-             created: Math.floor(Date.now() / 1000),
-             model: actualModel,
-             choices: [{ index: 0, delta: { reasoning_content: data.delta.thinking }, finish_reason: null }]
-           })}\n\n`;
-           const encoded = new TextEncoder().encode(chunk);
-           chunks.push(encoded);
-           reply.raw.write(encoded);
-          continue;
-        }
-       if (data.type === 'content_block_delta' && data.delta?.text) {
-      // 原来的正文处理...
-              const chunk = `data: ${JSON.stringify({
-                id: 'chatcmpl-' + Date.now(),
-                object: 'chat.completion.chunk',
-                created: Math.floor(Date.now() / 1000),
-                model: actualModel,
-                choices: [{ index: 0, delta: { content: data.delta.text }, finish_reason: null }]
-              })}\n\n`;
-              const encoded = new TextEncoder().encode(chunk);
-              chunks.push(encoded);
-              reply.raw.write(encoded);
-            } else if (data.type === 'message_stop') {
-              reply.raw.write(new TextEncoder().encode('data: [DONE]\n\n'));
-            }
-          } catch (e) {}
-        }
-      }
-    } else {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
         reply.raw.write(value);
       }
-    }
-    reply.raw.end();
+      reply.raw.end();
+    } else {
+      // 流式：缓冲末尾 检测记忆标记
+      let streamBuffer = '';
+      const MEM_HOLDBACK = 30;
 
-    // 拼接AI回复并存入记忆
-    try {
-      const decoder = new TextDecoder();
-      const fullText = chunks.map(c => decoder.decode(c, { stream: true })).join('');
-      let assistantReply = '';
-      const rLines = fullText.split('\n');
-      for (const rLine of rLines) {
-        if (rLine.startsWith('data: ') && !rLine.includes('[DONE]')) {
-          try {
-            const json = JSON.parse(rLine.slice(6));
-            const content = json.choices?.[0]?.delta?.content;
-            if (content) assistantReply += content;
-          } catch (e) {}
+      function flushContent(text) {
+        if (!text) return;
+        reply.raw.write(`data: ${JSON.stringify({
+          id: 'chatcmpl-' + Date.now(),
+          object: 'chat.completion.chunk',
+          created: Math.floor(Date.now() / 1000),
+          model: actualModel,
+          choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+        })}\n\n`);
+      }
+
+       function onDelta(text) {
+        assistantReply += text;
+        streamBuffer += text;
+
+      // 实时检测标记 在buffer里就截掉
+     const memMatch = streamBuffer.match(/\[MEM:(YES|NO)\]/);
+     if (memMatch) {
+       memDecision = memMatch[1] === 'YES';
+       streamBuffer = streamBuffer.replace(/\s*\[MEM:(YES|NO)\]\s*/, '');
+       console.log('记忆标记: [MEM:' + memMatch[1] + '] (已截取)');
+     }
+
+    if (streamBuffer.length > MEM_HOLDBACK) {
+       const safe = streamBuffer.slice(0, streamBuffer.length - MEM_HOLDBACK);
+       streamBuffer = streamBuffer.slice(streamBuffer.length - MEM_HOLDBACK);
+       flushContent(safe);
+     }
+   }
+
+        if (isAnthropic) {
+        let sseBuffer = '';
+        let currentToolIndex = -1;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          sseBuffer += decoder.decode(value, { stream: true });
+          const lines = sseBuffer.split('\n');
+          sseBuffer = lines.pop();
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const data = JSON.parse(line.slice(6));
+
+              // 工具调用开始
+              if (data.type === 'content_block_start' && data.content_block?.type === 'tool_use') {
+                currentToolIndex++;
+                reply.raw.write(`data: ${JSON.stringify({
+                  id: 'chatcmpl-' + Date.now(),
+                  object: 'chat.completion.chunk',
+                  created: Math.floor(Date.now() / 1000),
+                  model: actualModel,
+                  choices: [{ index: 0, delta: { tool_calls: [{ index: currentToolIndex, id: data.content_block.id, type: 'function', function: { name: data.content_block.name, arguments: '' } }] }, finish_reason: null }]
+                })}\n\n`);
+              }
+
+              if (data.type === 'content_block_delta') {
+                // 思维链
+                if (data.delta?.type === 'thinking_delta' && data.delta?.thinking) {
+                  reply.raw.write(`data: ${JSON.stringify({
+                    id: 'chatcmpl-' + Date.now(),
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: actualModel,
+                    choices: [{ index: 0, delta: { reasoning_content: data.delta.thinking }, finish_reason: null }]
+                  })}\n\n`);
+                }
+                // 工具参数流
+                else if (data.delta?.type === 'input_json_delta' && data.delta?.partial_json !== undefined) {
+                  reply.raw.write(`data: ${JSON.stringify({
+                    id: 'chatcmpl-' + Date.now(),
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: actualModel,
+                    choices: [{ index: 0, delta: { tool_calls: [{ index: currentToolIndex, function: { arguments: data.delta.partial_json } }] }, finish_reason: null }]
+                  })}\n\n`);
+                }
+                // 正文
+                else if (data.delta?.text) {
+                  onDelta(data.delta.text);
+                }
+              }
+            } catch (e) {}
+          }
+        }
+      } else {
+      
+        let sseBuffer = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          sseBuffer += decoder.decode(value, { stream: true });
+          const lines = sseBuffer.split('\n');
+          sseBuffer = lines.pop();
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            if (line.includes('[DONE]')) continue;
+            try {
+              const json = JSON.parse(line.slice(6));
+              const content = json.choices?.[0]?.delta?.content;
+              if (content) {
+                onDelta(content);
+              } else {
+                reply.raw.write(`data: ${JSON.stringify(json)}\n\n`);
+             }
+
+            } catch (e) {}
+          }
         }
       }
-      if (assistantReply && assistantReply.length > 5 && !isInternalRequest) {
-        const shouldStore = await shouldStoreMemory(assistantReply);
+
+      // 流结束：检测并截取记忆标记
+      
+      const tagMatch = streamBuffer.match(/\[MEM:(YES|NO)\]/);
+      if (tagMatch) {
+        memDecision = tagMatch[1] === 'YES';
+        streamBuffer = streamBuffer.replace(/\s*\[MEM:(YES|NO)\]\s*/, '');
+      }
+      assistantReply = assistantReply.replace(/\s*\[MEM:(YES|NO)\]\s*/g, '');
+      if (streamBuffer) flushContent(streamBuffer);
+      reply.raw.write('data: [DONE]\n\n');
+      reply.raw.end();
+
+      // 根据记忆标记存储
+      if (!isInternalRequest) {
+        const shouldStore = memDecision !== null ? memDecision : true;
+        console.log(`记忆标记: ${memDecision !== null ? '[MEM:' + (memDecision ? 'YES' : 'NO') + ']' : '未检测到，默认存储'}`);
+
         if (shouldStore) {
-          await storeMemory('assistant: ' + assistantReply);
-        } else {
-          console.log('记忆门卫：不存储此AI回复');
+          const userText = latestUserMsg ? normalizeContentToText(latestUserMsg.content) : '';
+          if (userText && userText.length > 2) {
+            storeMemory(userText, { role: 'user', timestamp: new Date().toISOString() })
+              .catch(err => console.error('存用户记忆失败:', err));
+          }
+          if (assistantReply && assistantReply.length > 5) {
+            storeMemory('assistant: ' + assistantReply)
+              .catch(err => console.error('存AI记忆失败:', err));
+          }
         }
       }
-    } catch (e) {
-      console.error('存储AI回复失败:', e);
     }
+
 
   } catch (err) {
     console.error(err);
