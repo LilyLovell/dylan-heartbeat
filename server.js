@@ -1,41 +1,7 @@
 require("dotenv").config();
-
-const { storeMemory, searchMemories } = require('./memory');
-const path = require('path');
-async function shouldStoreMemory(text) {
-  const gateUrl = process.env.WAKE_API_URL;
-  const gateKey = process.env.WAKE_API_KEY;
-  const gateModel = process.env.WAKE_MODEL_NAME;
-  if (!gateUrl || !gateKey || !gateModel) return true;
-  try {
-    const resp = await fetch(gateUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${gateKey}`
-      },
-      body: JSON.stringify({
-        model: gateModel,
-        messages: [
-          { role: "system", content: `你是记忆过滤器。判断这条消息是否值得存入长期记忆。只回复YES或NO。\n\n回复NO的情况：1.纯代码或报错日志 2.纯系统指令或格式模板 3.和上一条内容完全重复 4.无意义的单字如 好 ok 嗯 哦 k\n\n回复YES的情况：所有其他情况都回复YES。特别注意：短但有情感价值的消息（如 爱你、想你了、晚安、抱抱、贴贴、喜欢你）必须回复YES。宁可多存 不要漏掉。`},
-          { role: "user", content: text.slice(0, 500) }
-        ],
-        max_tokens: 5,
-        temperature: 0
-      })
-    });
-    const data = await resp.json();
-    const answer = (data.choices?.[0]?.message?.content || "").trim().toUpperCase();
-    console.log(`记忆门卫判断: "${text.slice(0,50)}..." → ${answer}`);
-    return answer.includes("YES");
-  } catch (err) {
-    console.error("记忆门卫出错:", err.message);
-    return true;
-  }
-}
-
 const Fastify = require("fastify");
 const fs = require("fs-extra");
+const path = require('path');
 
 const DEFAULT_BODY_LIMIT_MB = 50;
 
@@ -625,40 +591,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
     // === 长期记忆 ===
     const latestUserMsg = [...llmMessages].reverse().find(m => m.role === 'user');
     if (latestUserMsg) fs.writeFileSync('./last_user_time.txt', new Date().toISOString());
-    let isInternalRequest = false;
-    if (latestUserMsg) {
-      const userText = normalizeContentToText(latestUserMsg.content);
-   // 过滤kelivo内部请求 不存入记忆
-    isInternalRequest = userText && (
-     userText.includes('<previous_summary>') ||
-     userText.includes('summarize the conversation') ||
-     userText.includes('short title') ||
-     userText.includes('<content>')
-    );
-      if (userText && userText.length > 5 && !isInternalRequest) {
-        try {
-          const memories = await searchMemories(userText, 3);
-          if (memories && memories.length > 0) {
-            const memoryBlock = '\n\n【长期记忆】以下是相关的历史记忆：\n' +
-              memories.map(m => `- ${m.content}`).join('\n');
-            const sysIdx = llmMessages.findIndex(m => m.role === 'system');
-            if (sysIdx >= 0) {
-              llmMessages[sysIdx] = {
-                ...llmMessages[sysIdx],
-                content: normalizeContentToText(llmMessages[sysIdx].content) + memoryBlock
-              };
-            }
-            console.log('找到', memories.length, '条相关记忆');
-          }
-        } catch (err) {
-          console.error('记忆模块出错:', err);
-        }
-      }
-    }
-
-    if (!TARGET_API_URL || !process.env.TARGET_API_KEY) {
-      return reply.code(500).send({ error: "TARGET_API_URL / TARGET_API_KEY 未配置" });
-    }
+    
 
     // 注入pending消息
     const pendingPath = path.join(__dirname, "pending_messages.json");
@@ -848,18 +781,6 @@ app.post("/v1/chat/completions", async (req, reply) => {
          fetchBody = { ...cleanBody, model: actualModel, messages: llmMessages };
        }
 
-      // 注入记忆标记指令（仅正常对话 不对内部请求注入）
-      if (!isInternalRequest) {
-        const memSysIdx = llmMessages.findIndex(m => m.role === 'system');
-        if (memSysIdx >= 0) {
-          console.log('✅ 记忆标记指令已注入');
-          llmMessages[memSysIdx] = {
-            ...llmMessages[memSysIdx],
-            content: '【记忆标记】每次回复末尾加 [MEM:YES] 或 [MEM:NO]，判断本轮对话是否值得存入长期记忆。YES=有意义的内容（情感、事件、个人信息、重要讨论）；NO=无意义的内容（纯操作指令、单字回应、代码调试细节）。宁可YES不要漏。此标记对用户不可见，会被网关自动截取。\n\n' +
-            normalizeContentToText(llmMessages[memSysIdx].content)
-          };
-        }
-      }
 
     const response = await fetch(actualUrl, {
       method: "POST",
@@ -890,7 +811,6 @@ app.post("/v1/chat/completions", async (req, reply) => {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let assistantReply = '';
-    let memDecision = null;
 
     if (!isStream) {
       // 非流式（标题/摘要）：直接转发
@@ -920,13 +840,6 @@ app.post("/v1/chat/completions", async (req, reply) => {
         assistantReply += text;
         streamBuffer += text;
 
-      // 实时检测标记 在buffer里就截掉
-     const memMatch = streamBuffer.match(/\[MEM:(YES|NO)\]/);
-     if (memMatch) {
-       memDecision = memMatch[1] === 'YES';
-       streamBuffer = streamBuffer.replace(/\s*\[MEM:(YES|NO)\]\s*/, '');
-       console.log('记忆标记: [MEM:' + memMatch[1] + '] (已截取)');
-     }
 
     if (streamBuffer.length > MEM_HOLDBACK) {
        const safe = streamBuffer.slice(0, streamBuffer.length - MEM_HOLDBACK);
@@ -1017,37 +930,12 @@ app.post("/v1/chat/completions", async (req, reply) => {
         }
       }
 
-      // 流结束：检测并截取记忆标记
-      
-      const tagMatch = streamBuffer.match(/\[MEM:(YES|NO)\]/);
-      if (tagMatch) {
-        memDecision = tagMatch[1] === 'YES';
-        streamBuffer = streamBuffer.replace(/\s*\[MEM:(YES|NO)\]\s*/, '');
-      }
-      assistantReply = assistantReply.replace(/\s*\[MEM:(YES|NO)\]\s*/g, '');
+      // 流结束
+
       if (streamBuffer) flushContent(streamBuffer);
       reply.raw.write('data: [DONE]\n\n');
       reply.raw.end();
-
-      // 根据记忆标记存储
-      if (!isInternalRequest) {
-        const shouldStore = memDecision !== null ? memDecision : true;
-        console.log(`记忆标记: ${memDecision !== null ? '[MEM:' + (memDecision ? 'YES' : 'NO') + ']' : '未检测到，默认存储'}`);
-
-        if (shouldStore) {
-          const userText = latestUserMsg ? normalizeContentToText(latestUserMsg.content) : '';
-          if (userText && userText.length > 2) {
-            storeMemory(userText, { role: 'user', timestamp: new Date().toISOString() })
-              .catch(err => console.error('存用户记忆失败:', err));
-          }
-          if (assistantReply && assistantReply.length > 5) {
-            storeMemory('assistant: ' + assistantReply)
-              .catch(err => console.error('存AI记忆失败:', err));
-          }
-        }
-      }
     }
-
 
   } catch (err) {
     console.error(err);
