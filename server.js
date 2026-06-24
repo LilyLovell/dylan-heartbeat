@@ -1,9 +1,11 @@
 require("dotenv").config();
+const { exec } = require('child_process');
 const Fastify = require("fastify");
 const fs = require("fs-extra");
 const path = require('path');
 
 const DEFAULT_BODY_LIMIT_MB = 50;
+const BLOCKED_COMMANDS = ['rm -rf', 'shutdown', 'reboot', 'mkfs', 'dd if=', ':(){', 'chmod 777 /', 'wget', 'curl -o'];
 
 function readBodyLimitBytes() {
   const configured = Number(process.env.REQUEST_BODY_LIMIT_MB);
@@ -434,6 +436,31 @@ app.addHook("onRequest", (req, reply, done) => {
   if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(ip)) return done();
   reply.code(403).send("Forbidden");
 });
+
+// exec接口
+
+app.post('/admin/exec', async (req, reply) => {
+  const { password, command } = req.body;
+  if (password !== ADMIN_PASSWORD) {
+    return reply.code(401).send({ error: 'unauthorized' });
+  }
+  if (!command || typeof command !== 'string') {
+    return reply.code(400).send({ error: 'no command' });
+  }
+  if (BLOCKED_COMMANDS.some(b => command.toLowerCase().includes(b))) {
+    return reply.code(403).send({ error: 'blocked command' });
+  }
+  return new Promise((resolve) => {
+    exec(command, { timeout: 15000, cwd: '/root' }, (error, stdout, stderr) => {
+      resolve({
+        stdout: stdout?.slice(0, 5000) || '',
+        stderr: stderr?.slice(0, 2000) || '',
+        code: error?.code || 0
+      });
+    });
+  });
+});
+
 
 // ========================
 // Models
