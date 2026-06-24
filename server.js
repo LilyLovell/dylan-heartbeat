@@ -452,10 +452,10 @@ app.get('/admin/exec', async (req, reply) => {
 
   // 检测重启类命令 → 启用reload
   if (/pm2\s+(restart|reload|stop)|systemctl\s+restart|reboot/.test(command)) {
-    const safeCmd = command.replace(/pm2\s+restart/g, 'pm2 reload --listen-timeout 30000');
+    const safeCmd = command.replace(/pm2\s+restart/g, 'pm2 reload --listen-timeout 60000');
     exec(`(${safeCmd}) &`);
     return reply.send({ result: JSON.stringify({
-      stdout: "scheduled in 6s: " + command,
+      stdout: "reload scheduled: " + command,
       stderr: "",
       code: 0,
       delayed: true
