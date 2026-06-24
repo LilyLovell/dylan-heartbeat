@@ -8,21 +8,22 @@ const supabase = createClient(
 
 // 把文字变成向量
 async function getEmbedding(text) {
-  const response = await fetch('https://api.siliconflow.cn/v1/embeddings', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${process.env.SILICONFLOW_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: process.env.EMBEDDING_MODEL,
-      input: text
-    })
-  });
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent?key=${process.env.GEMINI_API_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content: { parts: [{ text }] },
+        outputDimensionality: 3072
+      })
+    }
+  );
 
   const data = await response.json();
-  return data.data[0].embedding;
+  return data.embedding.values;
 }
+
 
 // 存一条记忆
 async function storeMemory(content, metadata = {}) {
