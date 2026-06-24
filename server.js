@@ -438,7 +438,6 @@ app.addHook("onRequest", (req, reply, done) => {
 });
 
 // exec接口
-
 app.get('/admin/exec', async (req, reply) => {
   const { password, command } = req.query;
   if (password !== process.env.ADMIN_PASSWORD) {
@@ -450,6 +449,18 @@ app.get('/admin/exec', async (req, reply) => {
   if (BLOCKED_COMMANDS.some(b => command.toLowerCase().includes(b))) {
     return reply.code(403).send({ error: 'blocked command' });
   }
+
+  // 检测重启类命令 → 延迟执行，先让当前回复传完
+  if (/pm2\s+(restart|reload|stop)|systemctl\s+restart|reboot/.test(command)) {
+    exec(`(sleep 6 && ${command}) &`);
+    return reply.send({ result: JSON.stringify({
+      stdout: "scheduled in 6s: " + command,
+      stderr: "",
+      code: 0,
+      delayed: true
+    })});
+  }
+
   return new Promise((resolve) => {
     exec(command, { timeout: 15000, cwd: '/root' }, (error, stdout, stderr) => {
       resolve({
@@ -458,8 +469,9 @@ app.get('/admin/exec', async (req, reply) => {
         code: error?.code || 0
       });
     });
-  });
+  }).then(r => reply.send({ result: JSON.stringify(r) }));
 });
+
 
 
 // ========================
