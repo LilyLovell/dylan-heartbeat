@@ -1960,6 +1960,51 @@ app.post("/internal/heartbeat", async (req, reply) => {
 });
 
 // ========================
+// 记忆管理页面 GET /admin/memories
+// ========================
+function buildMemoriesHtml(mem, fErr) {
+  const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const cards = mem.map(m => {
+    const v = m.valence != null ? Number(m.valence) : null;
+    const a = m.arousal != null ? Number(m.arousal) : null;
+    const imp = m.importance != null ? Number(m.importance) : null;
+    const vc = v != null ? (v < 0 ? 'negative' : v > 0 ? 'positive' : '') : '';
+    const ct = m.created_at ? new Date(m.created_at).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}) : '?';
+    const at = m.last_accessed_at ? new Date(m.last_accessed_at).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}) : '--';
+    const c = esc(m.content);
+    let h = '<div class="card"><div class="hd"><span class="cid">#'+m.id+'</span><div class="meta">';
+    if(m.resolved) h += '<span class="t res">resolved</span>';
+    if(v!=null) h += '<span class="t '+vc+'">val '+v.toFixed(2)+'</span>';
+    if(a!=null) h += '<span class="t">aro '+a.toFixed(2)+'</span>';
+    if(imp!=null) h += '<span class="t">imp '+imp+'</span>';
+    h += '<span class="t">acc '+(m.activation_count||0)+'</span>';
+    h += '</div></div><div class="cc">'+c+'</div>';
+    h += '<div class="ft"><span>'+ct+'</span><span>last: '+at+'</span></div></div>';
+    return h;
+  }).join('');
+  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ombre Brain</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#e0e0e0;font-family:system-ui;padding:20px}h1{color:#c792ea;font-size:1.3em;margin-bottom:12px}a.bk{color:#89ddff;text-decoration:none;font-size:.9em}.st{color:#888;font-size:.85em;margin-bottom:16px}.err{color:#ff5370;border:1px solid #ff5370;border-radius:6px;padding:10px;margin-bottom:12px}.card{background:#1a1a2e;border:1px solid #2a2a4a;border-radius:8px;padding:14px;margin-bottom:10px}.card:hover{border-color:#c792ea}.hd{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:8px}.cid{color:#c792ea;font-weight:700;font-size:.95em}.meta{display:flex;gap:6px;flex-wrap:wrap}.t{font-size:.72em;padding:2px 8px;border-radius:10px;background:#16213e;color:#89ddff}.t.res{background:#1a3a2a;color:#c3e88d}.t.negative{background:#3a1a1a;color:#ff5370}.t.positive{background:#1a2a3a;color:#82aaff}.cc{font-size:.85em;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:#ccc;max-height:200px;overflow-y:auto}.cc::-webkit-scrollbar{width:4px}.cc::-webkit-scrollbar-thumb{background:#444;border-radius:2px}.ft{margin-top:8px;font-size:.73em;color:#666;display:flex;gap:16px}</style></head>
+<body><a class="bk" href="/admin">← back</a><h1>🧠 Ombre Brain</h1>
+<div class="st">${fErr?'':mem.length+' memories'}</div>${fErr?'<div class="err">'+fErr+'</div>':''}${cards}</body></html>`;
+}
+
+app.get("/admin/memories", { preHandler: basicAuth }, async (req, reply) => {
+  const sbUrl = process.env.SUPABASE_URL;
+  const sbKey = process.env.SUPABASE_KEY;
+  let memories = [];
+  let fetchError = null;
+  try {
+    const res = await fetch(sbUrl + "/rest/v1/memories?select=id,content,valence,arousal,importance,resolved,activation_count,created_at,last_accessed_at&order=id.desc", {
+      headers: { apikey: sbKey, Authorization: "Bearer " + sbKey }
+    });
+    if (!res.ok) throw new Error("Supabase " + res.status);
+    memories = await res.json();
+  } catch (e) { fetchError = e.message; }
+  reply.type("text/html").send(buildMemoriesHtml(memories, fetchError));
+});
+
+
+// ========================
 // 管理页一键重启
 // ========================
 app.post("/admin/restart", { preHandler: basicAuth }, async (req, reply) => {
