@@ -441,7 +441,7 @@ app.addHook("onRequest", (req, reply, done) => {
 
 app.post('/admin/exec', async (req, reply) => {
   const { password, command } = req.body;
-  if (password !== ADMIN_PASSWORD) {
+  if (password !== process.env.ADMIN_PASSWORD) {
     return reply.code(401).send({ error: 'unauthorized' });
   }
   if (!command || typeof command !== 'string') {
