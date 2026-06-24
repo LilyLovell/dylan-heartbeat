@@ -450,9 +450,10 @@ app.get('/admin/exec', async (req, reply) => {
     return reply.code(403).send({ error: 'blocked command' });
   }
 
-  // 检测重启类命令 → 延迟执行，先让当前回复传完
+  // 检测重启类命令 → 启用reload
   if (/pm2\s+(restart|reload|stop)|systemctl\s+restart|reboot/.test(command)) {
-    exec(`(sleep 6 && ${command}) &`);
+    const safeCmd = command.replace(/pm2\s+restart/g, 'pm2 reload --listen-timeout 30000');
+    exec(`(${safeCmd}) &`);
     return reply.send({ result: JSON.stringify({
       stdout: "scheduled in 6s: " + command,
       stderr: "",
