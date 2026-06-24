@@ -1973,19 +1973,191 @@ function buildMemoriesHtml(mem, fErr) {
     const at = m.last_accessed_at ? new Date(m.last_accessed_at).toLocaleString('zh-CN',{timeZone:'Asia/Shanghai'}) : '--';
     const c = esc(m.content);
     let h = '<div class="card"><div class="hd"><span class="cid">#'+m.id+'</span><div class="meta">';
-    if(m.resolved) h += '<span class="t res">resolved</span>';
-    if(v!=null) h += '<span class="t '+vc+'">val '+v.toFixed(2)+'</span>';
-    if(a!=null) h += '<span class="t">aro '+a.toFixed(2)+'</span>';
-    if(imp!=null) h += '<span class="t">imp '+imp+'</span>';
-    h += '<span class="t">acc '+(m.activation_count||0)+'</span>';
+    if(m.resolved) h += '<span class="t res">RESOLVED</span>';
+    if(v!=null) h += '<span class="t '+vc+'">VAL '+v.toFixed(2)+'</span>';
+    if(a!=null) h += '<span class="t">ARO '+a.toFixed(2)+'</span>';
+    if(imp!=null) h += '<span class="t">IMP '+imp+'</span>';
+    h += '<span class="t">ACC '+(m.activation_count||0)+'</span>';
     h += '</div></div><div class="cc">'+c+'</div>';
     h += '<div class="ft"><span>'+ct+'</span><span>last: '+at+'</span></div></div>';
     return h;
   }).join('');
-  return `<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Ombre Brain</title>
-<style>*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0f;color:#e0e0e0;font-family:system-ui;padding:20px}h1{color:#c792ea;font-size:1.3em;margin-bottom:12px}a.bk{color:#89ddff;text-decoration:none;font-size:.9em}.st{color:#888;font-size:.85em;margin-bottom:16px}.err{color:#ff5370;border:1px solid #ff5370;border-radius:6px;padding:10px;margin-bottom:12px}.card{background:#1a1a2e;border:1px solid #2a2a4a;border-radius:8px;padding:14px;margin-bottom:10px}.card:hover{border-color:#c792ea}.hd{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:8px}.cid{color:#c792ea;font-weight:700;font-size:.95em}.meta{display:flex;gap:6px;flex-wrap:wrap}.t{font-size:.72em;padding:2px 8px;border-radius:10px;background:#16213e;color:#89ddff}.t.res{background:#1a3a2a;color:#c3e88d}.t.negative{background:#3a1a1a;color:#ff5370}.t.positive{background:#1a2a3a;color:#82aaff}.cc{font-size:.85em;line-height:1.6;white-space:pre-wrap;word-break:break-all;color:#ccc;max-height:200px;overflow-y:auto}.cc::-webkit-scrollbar{width:4px}.cc::-webkit-scrollbar-thumb{background:#444;border-radius:2px}.ft{margin-top:8px;font-size:.73em;color:#666;display:flex;gap:16px}</style></head>
-<body><a class="bk" href="/admin">← back</a><h1>🧠 Ombre Brain</h1>
-<div class="st">${fErr?'':mem.length+' memories'}</div>${fErr?'<div class="err">'+fErr+'</div>':''}${cards}</body></html>`;
+  return `<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OMBRE BRAIN · Memories</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Noto+Serif+SC:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  @keyframes scanline {
+    0% { transform: translateY(-200px); }
+    100% { transform: translateY(100vh); }
+  }
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(15px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes text-glow {
+    0%, 100% { text-shadow: 0 0 10px rgba(0,255,255,0.5), 0 0 40px rgba(0,255,255,0.2); }
+    50% { text-shadow: 0 0 20px rgba(0,255,255,0.8), 0 0 60px rgba(0,255,255,0.3); }
+  }
+  @keyframes flicker {
+    0%, 100% { opacity: 1; }
+    92% { opacity: 1; }
+    93% { opacity: 0.8; }
+    94% { opacity: 1; }
+    96% { opacity: 0.6; }
+    97% { opacity: 1; }
+  }
+  @keyframes glow-pulse {
+    0%, 100% { box-shadow: 0 0 5px rgba(0,255,255,0.3), 0 0 20px rgba(0,255,255,0.1); }
+    50% { box-shadow: 0 0 10px rgba(0,255,255,0.5), 0 0 40px rgba(0,255,255,0.2); }
+  }
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: 'Courier New', 'Consolas', monospace;
+    background: #0a0a0f;
+    background-image:
+      radial-gradient(ellipse at 20% 50%, rgba(0,255,255,0.03) 0%, transparent 50%),
+      radial-gradient(ellipse at 80% 50%, rgba(255,0,128,0.03) 0%, transparent 50%);
+    min-height: 100vh;
+    padding: 60px 20px;
+    color: #c0c0c0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .scan-overlay {
+    position: fixed; top:0; left:0; right:0; bottom:0;
+    background: repeating-linear-gradient(0deg, transparent, transparent 2px, rgba(0,255,255,0.015) 2px, rgba(0,255,255,0.015) 4px);
+    pointer-events: none; z-index: 1000;
+  }
+  .scan-overlay::after {
+    content:''; position:absolute; top:0; left:0; right:0; height:200px;
+    background: linear-gradient(to bottom, transparent, rgba(0,255,255,0.03), transparent);
+    animation: scanline 8s linear infinite;
+  }
+  .container {
+    max-width: 700px; width: 100%;
+    background: rgba(10,10,20,0.85);
+    border: 1px solid rgba(0,255,255,0.15);
+    border-radius: 2px;
+    clip-path: polygon(0 12px, 12px 0, 100% 0, 100% calc(100% - 12px), calc(100% - 12px) 100%, 0 100%);
+    padding: 40px 32px;
+    box-shadow: 0 0 30px rgba(0,255,255,0.05), inset 0 0 60px rgba(0,0,0,0.5);
+    animation: fadeIn 0.6s ease-out;
+    position: relative; z-index: 1;
+  }
+  .container::before {
+    content:''; position:absolute; top:-1px; left:20%; right:20%; height:1px;
+    background: linear-gradient(90deg, transparent, #00ffff, transparent); opacity:0.6;
+  }
+  a.bk {
+    color: #00ffff; text-decoration: none; font-size: 10px;
+    letter-spacing: 2px; text-transform: uppercase; opacity: 0.6;
+    transition: opacity 0.3s;
+  }
+  a.bk:hover { opacity: 1; }
+  h1 {
+    font-size: 22px; font-weight: 700; color: #00ffff;
+    margin: 12px 0 4px; letter-spacing: 6px;
+    font-family: 'Courier New', monospace; text-transform: uppercase;
+    animation: text-glow 4s ease-in-out infinite, flicker 10s infinite;
+  }
+  .subtitle {
+    font-size: 10px; color: #ff0080; margin-bottom: 28px;
+    letter-spacing: 4px; text-transform: uppercase; opacity: 0.8;
+  }
+  .st {
+    font-size: 10px; color: #808080; margin-bottom: 20px;
+    letter-spacing: 2px; text-transform: uppercase;
+  }
+  .err {
+    color: #ff0080; border: 1px solid rgba(255,0,128,0.3);
+    background: rgba(255,0,128,0.05); border-radius: 2px;
+    padding: 12px 16px; margin-bottom: 16px; font-size: 11px;
+    letter-spacing: 1px;
+  }
+  .card {
+    background: rgba(0,255,255,0.02);
+    border: 1px solid rgba(0,255,255,0.08);
+    border-radius: 2px;
+    padding: 16px 20px;
+    margin-bottom: 12px;
+    transition: all 0.3s ease;
+    animation: fadeIn 0.8s ease-out;
+    position: relative;
+  }
+  .card::before {
+    content:''; position:absolute; top:-1px; left:10%; right:10%; height:1px;
+    background: linear-gradient(90deg, transparent, rgba(0,255,255,0.2), transparent);
+    opacity: 0; transition: opacity 0.3s;
+  }
+  .card:hover {
+    border-color: rgba(0,255,255,0.25);
+    box-shadow: 0 0 20px rgba(0,255,255,0.05), inset 0 0 30px rgba(0,255,255,0.02);
+  }
+  .card:hover::before { opacity: 1; }
+  .hd {
+    display:flex; justify-content:space-between; align-items:center;
+    flex-wrap:wrap; gap:8px; margin-bottom:10px;
+  }
+  .cid {
+    color: #00ffff; font-weight: 700; font-size: 13px;
+    letter-spacing: 2px; font-family: 'Courier New', monospace;
+  }
+  .meta { display:flex; gap:6px; flex-wrap:wrap; }
+  .t {
+    font-size: 9px; padding: 2px 8px; border-radius: 1px;
+    letter-spacing: 1px; text-transform: uppercase;
+    font-family: 'Courier New', monospace;
+    background: rgba(0,255,255,0.06); color: #00ffff;
+    border: 1px solid rgba(0,255,255,0.12);
+  }
+  .t.res {
+    background: rgba(0,255,65,0.08); color: #00ff41;
+    border-color: rgba(0,255,65,0.2);
+  }
+  .t.negative {
+    background: rgba(255,0,128,0.08); color: #ff0080;
+    border-color: rgba(255,0,128,0.2);
+  }
+  .t.positive {
+    background: rgba(0,100,255,0.08); color: #82aaff;
+    border-color: rgba(0,100,255,0.2);
+  }
+  .cc {
+    font-size: 12px; line-height: 1.7; white-space: pre-wrap;
+    word-break: break-all; color: #a0a0a0;
+    max-height: 200px; overflow-y: auto;
+    font-family: 'Noto Serif SC', serif;
+    padding-right: 8px;
+  }
+  .cc::-webkit-scrollbar { width: 3px; }
+  .cc::-webkit-scrollbar-track { background: transparent; }
+  .cc::-webkit-scrollbar-thumb { background: rgba(0,255,255,0.15); border-radius: 1px; }
+  .cc::-webkit-scrollbar-thumb:hover { background: rgba(0,255,255,0.3); }
+  .ft {
+    margin-top: 10px; font-size: 9px; color: #404050;
+    display: flex; gap: 20px; letter-spacing: 1px;
+    font-family: 'Courier New', monospace;
+  }
+</style>
+</head>
+<body>
+<div class="scan-overlay"></div>
+<div class="container">
+  <a class="bk" href="/admin">← back</a>
+  <h1>OMBRE BRAIN</h1>
+  <div class="subtitle">memory archive</div>
+  <div class="st">${fErr ? '' : mem.length + ' fragments loaded'}</div>
+  ${fErr ? '<div class="err">ERROR :: '+fErr+'</div>' : ''}
+  ${cards}
+</div>
+</body>
+</html>`;
 }
 
 app.get("/admin/memories", { preHandler: basicAuth }, async (req, reply) => {
