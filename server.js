@@ -439,8 +439,8 @@ app.addHook("onRequest", (req, reply, done) => {
 
 // exec接口
 
-app.post('/admin/exec', async (req, reply) => {
-  const { password, command } = req.body;
+app.get('/admin/exec', async (req, reply) => {
+  const { password, command } = req.query;
   if (password !== process.env.ADMIN_PASSWORD) {
     return reply.code(401).send({ error: 'unauthorized' });
   }
