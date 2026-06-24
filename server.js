@@ -431,6 +431,9 @@ function readRestartCommand() {
 // ========================
 app.addHook("onRequest", (req, reply, done) => {
   if (req.url.startsWith("/admin")) return done();
+  if (url.startsWith('/admin') || url.startsWith('/v1/')) {
+  return;
+}
   const ip = req.ip || req.connection.remoteAddress;
   if (ip === "127.0.0.1" || ip === "::1" || ip === "localhost") return done();
   if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(ip)) return done();
@@ -449,6 +452,41 @@ app.get('/admin/exec', async (req, reply) => {
   if (BLOCKED_COMMANDS.some(b => command.toLowerCase().includes(b))) {
     return reply.code(403).send({ error: 'blocked command' });
   }
+
+app.post('/admin/exec', async (req, reply) => {
+  const { password, command } = req.body;
+  if (password !== process.env.ADMIN_PASSWORD) {
+    return reply.code(401).send({ error: 'Unauthorized' });
+  }
+  if (!command || typeof command !== 'string') {
+    return reply.code(400).send({ error: 'no command' });
+  }
+  if (BLOCKED_COMMANDS.some(b => command.toLowerCase().includes(b))) {
+    return reply.code(403).send({ error: 'blocked command' });
+  }
+
+  if (/pm2\s+(restart|reload|stop)|systemctl\s+restart|reboot/.test(command)) {
+    const safeCmd = command.replace(/pm2\s+restart/g, 'pm2 reload --listen-timeout 60000');
+    exec(`(${safeCmd}) &`);
+    return reply.send({ result: JSON.stringify({
+      stdout: "reload scheduled: " + command,
+      stderr: "",
+      code: 0,
+      delayed: true
+    })});
+  }
+
+  return new Promise((resolve) => {
+    exec(command, { timeout: 15000, cwd: '/root' }, (error, stdout, stderr) => {
+      resolve({
+        stdout: stdout?.slice(0, 5000) || '',
+        stderr: stderr?.slice(0, 2000) || '',
+        code: error?.code || 0
+      });
+    });
+  });
+});
+
 
   // 检测重启类命令 → 启用reload
   if (/pm2\s+(restart|reload|stop)|systemctl\s+restart|reboot/.test(command)) {
